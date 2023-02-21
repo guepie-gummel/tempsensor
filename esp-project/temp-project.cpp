@@ -1,6 +1,11 @@
 /**************************************************************
-Teichtemp mit Webserver ohne Blynk
+Temperature sensor with Webserver w/o Blynk framework (https://blynk.io/getting-started) -> "bare metal"
  **************************************************************/
+
+// FEATURE-SECTION
+#undef FEATURE_OVER_THE_AIR_UPDATE_ENABLED
+#define FEATURE_USE_DALLAS_TEMPSENSOR_ENABLED
+#define DEBUG_OUTPUT
 
 #include <ESP8266WiFi.h>
 
@@ -9,109 +14,171 @@ Teichtemp mit Webserver ohne Blynk
 
 
 #include <ESP8266HTTPClient.h> //neu
-#include <ArduinoOTA.h> //neu
-
+#ifdef FEATURE_OVER_THE_AIR_UPDATE_ENABLED
+  #include <ArduinoOTA.h> //neu
+#endif
 
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 
-ESP8266WebServer server(80);    // Create a webserver object that listens for HTTP request on port 80
-MDNSResponder mdns;              //webserver
 
-time_t getNtpTime();
-time_t prevDisplay = 0; // when the digital clock was displayed
-void sendNTPpacket(IPAddress &address);
-#define NTP_SERVER "europe.pool.ntp.org"  //#define NTP_SERVER "pool.ntp.org"
+// META-information for the SW / uC
+const char compile_date[] = __DATE__ " " __TIME__;
+int start_date;   //Neustart-Datum uC für Debugausgabe
+
+
+// WIFI section
+// settings for WLAN connection for further processing
+#include "WiFi_settings.h"
+char ssid[] = WLAN_SSID;  //"GummelNMel";
+char pass[] = WLAN_PWD;   // "0391292846245736";
+
+
+// Webserver section (would be incorporated by Blynk framework)
+#define HTTP_WEBSRV_PORT   80
+ESP8266WebServer server(HTTP_WEBSRV_PORT);    // Create a webserver object that listens for HTTP request on given port
+MDNSResponder mdns;              // -webserver- => Multicast Domain Name Server => able to resolve a name instead of using IP-adresses
+
+
+// UDP protocol handler
+// used for internet communication like NTP etc.
+// ressources:
+//  https://www.rfc-editor.org/rfc/rfc768.html -> User Datagram Protocol
+//  https://www.rfc-editor.org/rfc/rfc791 -> INTERNET PROTOCOL
+WiFiUDP Udp;  // create an object for UDP connection over WiFi
+unsigned int localPort = 8888;  // local port to listen for UDP packets
+
+
+// NTP Network Time Protocol
+// used to get the current time for the ESP-device
+// ressources:
+//  https://www.rfc-editor.org/rfc/rfc1305 -> (outdated) Network Time Protocol (Version 3) Specification, Implementation and Analysis
+//  https://www.rfc-editor.org/rfc/rfc5905.html -> (used here) Network Time Protocol Version 4: Protocol and Algorithms Specification
+// requires:
+//  UDP protocol
+// improve: use of NTP class e.g. https://github.com/arduino-libraries/NTPClient / 
+#define NTP_SERVER      "europe.pool.ntp.org"  //#define NTP_SERVER "pool.ntp.org"
+#define NTP_UDP_PORT    123
+#define TIME_ONEDAY_IN_SECONDS 86400 // TEST: 1U*24U*60U*60U -> [d]*[h]*[min]*[sec]
 IPAddress timeServerIP;   // IP aus POOL
 IPAddress timeServerIPBraunschweig(192,53,103,104); //Braunschweig - GP: quasi als backup wenn man aus dem POOL nichts zu Stande bringt
 int timeZone = 1;     // UTC +1 = Winterzeit, UTC + 2 = Sommerzeit
 int countntpnio = 0;  //zählt fehlerhafte Versuche ntp
+time_t prevDisplay = 0; // when the digital clock was displayed
+time_t getNtpTime();
+void sendNTPpacket(IPAddress &address);
 
-const char compile_date[] = __DATE__ " " __TIME__;
-int start_date;   //Neustart uC für Debugausgabe
 
-WiFiUDP Udp;  // create an object for UDP connection over WiFi
-unsigned int localPort = 8888;  // local port to listen for UDP packets
 
 // temporary variables for time and date values => extraction of NTP time
 byte hourval, minuteval, secondval, monthval, dayval;
 int  yearval;
 
+// Temperature storage space
+// ToDo: Implement ring-buffer like storage
 int tempspeicher[2] [1000];          // Speicher für Temp (GP: Zeitstempel + Temperatur mit einer Queue-Size von 1000 Einträgen)
 int laufvar_tempspeicher=0;
 
-#include <OneWire.h> 
-#include <DallasTemperature.h>
+// section for temperature sensor
+// OneWire connection
+// Abstraction for temperature sensor via Dallas Semiconductor C++ class
+#include <OneWire.h>
+#ifdef FEATURE_USE_DALLAS_TEMPSENSOR_ENABLED
+  #include <DallasTemperature.h>
+#endif
 
 #define ONE_WIRE_BUS D4   // PIN Temperatursensor
-
 OneWire oneWire(ONE_WIRE_BUS); 
-DallasTemperature sensors(&oneWire);
+#ifdef FEATURE_USE_DALLAS_TEMPSENSOR_ENABLED
+  DallasTemperature sensors(&oneWire);
+#endif
 
 DeviceAddress sensorDeviceAddress;
-
-// settings for WLAN connection for further processing
-char ssid[] = "GummelNMel";
-char pass[] = "0391292846245736";
-
 int numberOfDevices; // Anzahl der gefundenen Sensoren
 
 
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// let the execution begin!
+// The Arduino standard "1st executed service"
 void setup()
 { 
-  // ArduinoOTA.begin(); // GP: relevant wenn OTA-Update des ESP gewünscht wäre
+  
+#ifdef FEATURE_OVER_THE_AIR_UPDATE_ENABLED
+  ArduinoOTA.begin(); // GP: relevant wenn OTA-Update des ESP gewünscht wäre
+#endif
 
-  // Open up a serial connection in order to see the connection status in Serial Monitor plus any further alive / debug messages
+// Open up a serial connection in order to see the connection status in Serial Monitor plus any further alive / debug messages
   Serial.begin(115200);
 
-  // Open up a WiFi connection to a router etc.
+// Open up a WiFi connection to a router etc.
   WiFi.begin(ssid, pass);
 
-  // Query the connection status and "wait" until the connection could be established
+// Query the connection status and "wait" until the connection could be established
+  // ToDo -> integrate this within a loop instead of multiple if-statements or even better outsource this as a waitForConnection-service
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("kein WIFI - step 1");
+    // ToDo -> Alternative: Use of the "F()-macro" in order to safe SRAM but take use of Flash memory e.g. https://arduinogetstarted.com/faq/what-is-serial.println-f 
+    //Serial.println(F("kein WIFI - step 1"));
     delay(2000);}
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("kein WIFI - step 2");
+    // ToDo - F()-macro
     delay(2000);}
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("kein WIFI - step 3");
+    // ToDo - F()-macro
     delay(2000);}
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("kein WIFI - step 4");
+    // ToDo - F()-macro
     delay(2000);}
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("kein WIFI - step 5");
+    // ToDo - F()-macro
     delay(2000);}
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("kein WIFI - step 6");
+    // ToDo - F()-macro
     delay(2000);}
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("kein WIFI - step 7");
-    Serial.println("Oops, thats bad - no WiFi connection could be established");}
+    Serial.println("Oops, thats bad - no WiFi connection could be established");
+    // ToDo - F()-macro
+  }
   else {
     Serial.println("");
     Serial.println("WiFi connected");  
     Serial.println("IP address: ");
+    // ToDo - F()-macro
+    // ToDo -> combine in 1 command like:
+    // Serial.println("\n"
+    //              "WiFi connected\n"
+    //              "IP address: \n")
+    // Alternative:
+    // Serial.println( F("\n WiFi connected\n IP address: \n") )
     Serial.println(WiFi.localIP());  
     delay(3000);
   }
   
   // ToDo: Assumption, that everything went right => we can continue => generally this is no robust implementation at the very first!
+  // ToDo - F()-macro
   Serial.println("ESP Alive");
-  Serial.println("Starting UDP");
+  Serial.println("Starting UDP protocol handler");
   
-  // Establish a UDP connection / port as a prerequesite for NTP querries
+// Establish a UDP connection / port as a prerequesite for NTP querries
   Udp.begin(localPort);
 
+  // debugging output
   Serial.print("Local port: ");
   Serial.println(Udp.localPort());
   Serial.println("waiting for sync");
-  // Resolve the given hostname of a NTP_SERVER to an IP address
+
+// Resolve the given hostname of a NTP_SERVER to an IP address
   WiFi.hostByName(NTP_SERVER, timeServerIP);
 
+// "time settings" for the ESP-device or precise: declare a time providing service (via setSyncProvider()) to a time-library (time.cpp) and set a re-sync cycle via setSyncInterval()
   setSyncProvider(getNtpTime);
-  setSyncInterval(86400); // 1 Tag    in sek 7200=2STd nach dieser zeit wird versucht, die Zeit neu vom Server zu beziehen
+  setSyncInterval(TIME_ONEDAY_IN_SECONDS); // 1 Tag    in sek 7200=2STd nach dieser zeit wird versucht, die Zeit neu vom Server zu beziehen
 
   // ToDo: Hier an der Stelle als auch innerhalb von getNtpTime scheint mir ein Gewurschtel zu sein.
   // Da das in der Setup passiert sollte da meiner Ansicht nach keinesfalls die 3 rauskommen
@@ -127,19 +194,30 @@ void setup()
   
   //Serial.print("M. n. NTP: "); Serial.println(millis());
   setvals();
-  Serial.print(hour());Serial.print(":");Serial.print(minute()); Serial.print("  ");Serial.print(day());Serial.print("-");Serial.print(month());Serial.print("-");Serial.println(year());
-  if (summertime_EU()){adjustTime(3600); setvals();}    
-  Serial.print("Es ist "); Serial.print(hourval); Serial.print(" "); Serial.print(minuteval); Serial.print(" ");Serial.print(secondval); Serial.print(" weekday: "); Serial.println(weekday()); 
+  Serial.print(hour());  Serial.print(":");   Serial.print(minute()); Serial.print("  ");Serial.print(day());Serial.print("-");Serial.print(month());Serial.print("-");Serial.println(year());
+  if (summertime_EU()){
+    adjustTime(3600);
+    setvals();
+  }    
+  // Print the current time
+  Serial.print("Es ist ");
+  Serial.print(hourval);
+  Serial.print(" ");
+  Serial.print(minuteval);
+  Serial.print(" ");
+  Serial.print(secondval);
+  Serial.print(" weekday: ");
+  Serial.println(weekday()); 
   start_date= hourval*10000+minuteval*100+secondval;  
 
- Serial.println("Suche Temperatur Sensoren...");
- sensors.begin();
- numberOfDevices = sensors.getDeviceCount();
- Serial.print("Habe ");
- Serial.print(numberOfDevices, DEC);
- Serial.println(" Sensoren gefunden.");
+  Serial.println("Suche Temperatur Sensoren...");
+  sensors.begin();
+  numberOfDevices = sensors.getDeviceCount();
+  Serial.print("Habe ");
+  Serial.print(numberOfDevices, DEC);
+  Serial.println(" Sensoren gefunden.");
 
- WiFi.hostname("Temperaturlogger");
+  WiFi.hostname("Temperaturlogger");
   
   //sensors.begin();
   sensors.getAddress(sensorDeviceAddress, 0);
@@ -177,7 +255,8 @@ void setup()
 
 
 void loop()
-{ mdns.update();
+{ 
+  mdns.update();
   server.handleClient();
   ArduinoOTA.handle();
   
@@ -236,23 +315,24 @@ time_t getNtpTime()
   while (Udp.parsePacket() > 0) ; // discard any previously received packets
 
   if(WiFi.status() != WL_CONNECTED){
-    Serial.println("kein WlanSync");
+    Serial.println("kein WlanSync"); // ToDo - F()-macro
     return 0;
   }
 
   // debugmessage to show that a NTP request is sent
-  Serial.print("NTP Request to IP: ");
-
-  if (countntpnio>9999){
+  Serial.print("NTP Request to IP: "); // ToDo - F()-macro
+ 
+  if (countntpnio>9999){ //ToDo: hässlicher "Fix" weil der NiO von aussen modifiziert wird!
     Serial.println(timeServerIPBraunschweig);
     sendNTPpacket(timeServerIPBraunschweig);  //Rückfall auf Braunschweig wenn 2x nio in Setup
   }
   else if (countntpnio%2 == 1){
     WiFi.hostByName(NTP_SERVER, timeServerIP);
-    Serial.print("new hostByName ");
+    Serial.print("new hostByName "); // ToDo - F()-macro
     Serial.println(timeServerIP);
     sendNTPpacket(timeServerIP);
-    countntpnio++;}  //neue IP bei jedem n.i.o.
+    countntpnio++;
+  }  //neue IP bei jedem n.i.o.
   else {
     Serial.println(timeServerIP);
     sendNTPpacket(timeServerIP);
@@ -279,23 +359,24 @@ time_t getNtpTime()
 }
 
 // send an NTP request to the time server at the given address
+// source: https://github.com/esp8266/Arduino/blob/master/libraries/ESP8266WiFi/examples/NTPClient/NTPClient.ino
 void sendNTPpacket(IPAddress &address){
   // set all bytes in the buffer to 0
   memset(packetBuffer, 0, NTP_PACKET_SIZE);
   // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
+  // (see "..URL above.." or https://www.ietf.org/rfc/rfc5905.txt [Page 18] for details on the packets)
+  packetBuffer[0] = 0b11 100 011;   // LI (2-bit) = 3 aka. unknown, Version (3-bit) = 4, Mode (3-bit) = 3 aka. client
+  packetBuffer[1] = 0;     // Stratum, or type of clock = 0 aka. "unspecified or invalid"
+  packetBuffer[2] = 6;     // Polling Interval in log2 seconds => 6 == 2,584 sec
   packetBuffer[3] = 0xEC;  // Peer Clock Precision
   // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49;
+  packetBuffer[12]  = 49;   // reference ID - clarification of these contents see: https://forum.arduino.cc/t/udp-ntp-clients/95868
   packetBuffer[13]  = 0x4E;
   packetBuffer[14]  = 49;
   packetBuffer[15]  = 52;
   // all NTP fields have been given values, now
   // you can send a packet requesting a timestamp:                 
-  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  Udp.beginPacket(address, NTP_UDP_PORT); // NTP requests are to port 123 as by RFC "..When operating in symmetric modes (1 and 2), this field must contain the NTP port number PORT (123) assigned by the IANA.  In other modes, it can contain any number consistent with local policy.."
   Udp.write(packetBuffer, NTP_PACKET_SIZE);
   Udp.endPacket();
 }
