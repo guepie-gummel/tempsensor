@@ -30,8 +30,8 @@ int start_date;   //Neustart-Datum uC für Debugausgabe
 // WIFI section
 // settings for WLAN connection for further processing
 #include "WiFi_settings.h"
-char ssid[] = WLAN_SSID;  //"GummelNMel";
-char pass[] = WLAN_PWD;   // "0391292846245736";
+char ssid[] = WLAN_SSID;  //"mein Standard WLAN - ich und Frau";
+char pass[] = WLAN_PWD;   // "meins mit den vielen Zahlen";
 
 
 // Webserver section (would be incorporated by Blynk framework)
